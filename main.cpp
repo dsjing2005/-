@@ -1,6 +1,7 @@
 #include "threadpool.h"
 
 #include <chrono>
+#include <stdexcept>
 #include <thread>
 
 /*
@@ -96,7 +97,8 @@ int main()
     std::cout<< sum1 << std::endl;
 #endif 
 
-#if 1
+#if 0
+    // DEMO_FIXED
     ThreadPool pool;
     pool.start(2);
     std::future<int> r1 = pool.submitTask(sum1, 1, 2);
@@ -112,5 +114,82 @@ int main()
     std::cout << r8.get() << std::endl;
 
 #endif
+
+#if 1
+    // REPRO_CACHED
+    // Occupy the sole worker and fill the one-slot queue.
+    // The next submission starts another worker but still rejects that task.
+    // Compile with -DMY_DEBUG to see the growth and the idle worker's exit.
+    {
+        std::promise<void> started;
+        auto startedFuture = started.get_future();
+        std::promise<void> release;
+        auto gate = release.get_future().share();
+
+        ThreadPool pool;
+        pool.setMode(PoolMode::MODE_CACHED);
+        pool.setTaskQueMaxThreshold(1);
+        pool.setThreadMaxThreshold(2);
+        pool.start(1);
+        auto running = pool.submitTask([&started, gate] {
+            started.set_value();
+            gate.wait();
+        });
+        startedFuture.wait();
+
+        auto queued = pool.submitTask([] {});
+        auto rejected = pool.submitTask([] {});
+        try {
+            rejected.get();
+            std::cout << "Third submission accepted" << std::endl;
+        } catch (const std::runtime_error& e) {
+            std::cout << "Third submission: " << e.what() << std::endl;
+        }
+
+        release.set_value();
+        running.get();
+        queued.get();
+        // Break on the next output to inspect curThreadSize_ and threads_.size().
+        // In the current code they should be 1 and 2 after the idle timeout.
+        std::cout << "Waiting for cached worker to exit" << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(62));
+        std::cout << "Idle timeout observation complete" << std::endl;
+    }
+#endif
+
+#if 0
+    // REPRO_SHUTDOWN
+    // Leave scope while a task is still running. Use a shell timeout because
+    // the current destructor can race with workers that still use pool members.
+    std::cout << "Starting shutdown stress test" << std::endl;
+    for (int i = 0; i < 100; ++i) {
+        std::promise<void> started;
+        auto startedFuture = started.get_future();
+        ThreadPool pool;
+        pool.start(2);
+        auto done = pool.submitTask([&started] {
+            started.set_value();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        });
+        startedFuture.wait();
+        // Deliberately skip done.get() to exercise destruction during the task.
+    }
+    std::cout << "Shutdown stress test completed" << std::endl;
+#endif
+
+#if 0
+    // REPRO_BEFORE_START
+    // Check readiness with a bounded wait, then start the worker for cleanup.
+    {
+        ThreadPool pool;
+        auto result = pool.submitTask([] { return 42; });
+        if (result.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout) {
+            std::cout << "Task still pending before start()" << std::endl;
+        }
+        pool.start(1);
+        std::cout << "Result after start(): " << result.get() << std::endl;
+    }
+#endif
+
     return 0;
 }
